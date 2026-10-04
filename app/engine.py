@@ -29,6 +29,12 @@ the downstream source node is replaced in place by a single projection that
 copies the mapped upstream export columns, and the upstream export together
 with its dependency ancestors is appended (ids renamed where they collide).
 Provenance at the replacement position is taken from the upstream graph.
+
+``diff`` reviews two independently submitted graphs (a baseline and a
+candidate) under the same whole-graph rules and compares their export
+columns pairwise by column name, reporting per-column before/after blocked
+verdicts and the added/removed content and row reasons, plus a risk-rollback
+marker. Neither input graph is modified and no revised graph is produced.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from typing import Union
 
 from .models import (
     ComposeRequest,
+    DiffRequest,
     FilterNodeIn,
     JoinNodeIn,
     PreviewRequest,
@@ -366,6 +373,140 @@ def _review_export(
 def review(request: ReviewRequest) -> dict[str, object]:
     _by_id, _order, relations = _evaluate_graph(request)
     return _review_export(request.export, relations)
+
+
+# ---------------------------------------------------------------------------
+# Version-to-version comparison of export risks
+# ---------------------------------------------------------------------------
+
+
+def _origin_set(reasons: list[dict[str, str]]) -> frozenset[Origin]:
+    """Parse a reviewed column's reason view back into origin pairs."""
+    return frozenset((reason["node_id"], reason["column"]) for reason in reasons)
+
+
+def _column_diff(
+    name: str,
+    base_col: dict[str, object] | None,
+    cand_col: dict[str, object] | None,
+) -> dict[str, object]:
+    """Compare one paired export column between the two reviews.
+
+    A side absent from one version reports ``null`` for that side's verdict,
+    and its reason sets are treated as empty. ``regression`` is the
+    risk-rollback marker described on :func:`diff`.
+    """
+    base_content = (
+        _origin_set(base_col["content_reasons"])
+        if base_col is not None
+        else frozenset()
+    )
+    cand_content = (
+        _origin_set(cand_col["content_reasons"])
+        if cand_col is not None
+        else frozenset()
+    )
+    base_rows = (
+        _origin_set(base_col["row_reasons"]) if base_col is not None else frozenset()
+    )
+    cand_rows = (
+        _origin_set(cand_col["row_reasons"]) if cand_col is not None else frozenset()
+    )
+
+    content_added = cand_content - base_content
+    content_removed = base_content - cand_content
+    rows_added = cand_rows - base_rows
+    rows_removed = base_rows - cand_rows
+
+    if cand_col is not None:
+        cand_blocked: bool | None = bool(cand_col["blocked"])
+    else:
+        cand_blocked = None
+    base_blocked: bool | None = (
+        bool(base_col["blocked"]) if base_col is not None else None
+    )
+
+    if base_col is None:
+        # A newly introduced blocked column is a rollback; a newly introduced
+        # safe column never is.
+        regression = cand_blocked is True
+    elif cand_col is None:
+        # Removing a blocked (or safe) column is never itself a rollback.
+        regression = False
+    else:
+        # Same column present in both versions: any newly appearing reason of
+        # either kind rolls back — including an origin moving from content
+        # influence to row influence even when the column stayed blocked.
+        regression = bool(content_added or rows_added)
+
+    return {
+        "name": name,
+        "baseline": {"blocked": base_blocked},
+        "candidate": {"blocked": cand_blocked},
+        "content_reasons": {
+            "added": _origin_view(content_added),
+            "removed": _origin_view(content_removed),
+        },
+        "row_reasons": {
+            "added": _origin_view(rows_added),
+            "removed": _origin_view(rows_removed),
+        },
+        "regression": regression,
+    }
+
+
+def diff(request: DiffRequest) -> dict[str, object]:
+    """Compare the export risks of a baseline graph against a candidate.
+
+    Both whole graphs are validated under exactly the same rules as
+    :func:`review` (the baseline first, then the candidate); if either is
+    invalid the whole request is rejected with the usual error and no partial
+    comparison is produced. The two input graphs are never modified and no
+    revised graph is generated.
+
+    Export columns are paired by name. The columns section first lists, in the
+    candidate's column order, every column the candidate exports (columns
+    shared with the baseline plus newly added ones); columns deleted from the
+    candidate follow afterwards, in the baseline's column order. Each entry
+    carries both sides' blocked verdict (``null`` on the absent side), the
+    added/removed content and row reasons (an absent side contributes the
+    empty set), and a per-column ``regression`` marker.
+
+    ``regression`` is true only for a newly added *blocked* column or a shared
+    column that gains at least one reason of either kind — a content origin
+    newly surfacing as a row origin counts as a gained row reason even when the
+    column was already blocked. Deleted blocked columns and newly added safe
+    columns do not roll back. The top-level ``regression`` is the OR of the
+    per-column markers.
+    """
+    _b_by_id, _b_order, b_relations = _evaluate_graph(request.baseline)
+    _c_by_id, _c_order, c_relations = _evaluate_graph(request.candidate)
+    baseline_review = _review_export(request.baseline.export, b_relations)
+    candidate_review = _review_export(request.candidate.export, c_relations)
+
+    base_cols = {col["name"]: col for col in baseline_review["columns"]}
+    cand_cols = {col["name"]: col for col in candidate_review["columns"]}
+
+    # Shared and added columns follow the candidate order; deleted columns are
+    # appended afterwards in the baseline order.
+    ordered_names = [col["name"] for col in candidate_review["columns"]]
+    ordered_names.extend(
+        name
+        for name in (col["name"] for col in baseline_review["columns"])
+        if name not in cand_cols
+    )
+
+    columns = [
+        _column_diff(name, base_cols.get(name), cand_cols.get(name))
+        for name in ordered_names
+    ]
+
+    return {
+        "baseline": baseline_review,
+        "candidate": candidate_review,
+        "columns": columns,
+        "regression": any(col["regression"] for col in columns),
+    }
 
 
 def serialize_node(node: object) -> dict[str, object]:

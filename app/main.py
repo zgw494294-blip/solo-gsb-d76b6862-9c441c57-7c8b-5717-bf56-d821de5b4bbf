@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from .engine import (
     ValidationError,
     compose,
+    diff,
     preview,
     prune,
     rename,
@@ -14,6 +15,7 @@ from .engine import (
 )
 from .models import (
     ComposeRequest,
+    DiffRequest,
     PreviewRequest,
     PruneRequest,
     RenameRequest,
@@ -31,12 +33,13 @@ app = FastAPI(
         "columns of a source node while keeping every in-graph reference "
         "pointing at the same original columns, can compose an upstream "
         "graph's export into a downstream graph's source position, yielding "
-        "one reviewable combined graph, and can run a small-sample preview "
+        "one reviewable combined graph, can compare a baseline processing graph against a candidate "
+        "revision column by column to surface newly introduced export risks, and can run a small-sample preview "
         "of an export over caller-provided source rows and filter "
         "conditions, returning sample data only when the export passes "
         "review."
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -82,6 +85,11 @@ async def rename_source_columns(request: RenameRequest) -> dict[str, object]:
 @app.post("/api/compose")
 async def compose_graphs(request: ComposeRequest) -> dict[str, object]:
     return compose(request)
+
+
+@app.post("/api/diff")
+async def diff_exports(request: DiffRequest) -> dict[str, object]:
+    return diff(request)
 
 
 @app.post("/api/preview")

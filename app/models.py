@@ -96,6 +96,21 @@ class ReviewRequest(StrictModel):
     export: str = Field(min_length=1)
 
 
+class DiffRequest(StrictModel):
+    """Two review-shaped graphs compared version against version.
+
+    ``baseline`` and ``candidate`` each carry ``nodes`` + ``export`` and are
+    validated independently by exactly the same rules as ``ReviewRequest``;
+    when either graph is invalid the whole comparison is rejected (HTTP 400),
+    never partially answered. Export columns are paired by column name: an
+    identically named export column is treated as the same output on both
+    sides, regardless of how its lineage inside the graph changed.
+    """
+
+    baseline: ReviewRequest
+    candidate: ReviewRequest
+
+
 class ReviseRequest(StrictModel):
     """A review request plus the export columns the caller allows nulling.
 

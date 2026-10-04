@@ -25,6 +25,11 @@
 只追加上游导出及其全部依赖祖先（沿用上游节点原序与列定义，ID 冲突自动改成全图唯一 ID），
 替换位置的内容与行影响取自上游，详见下文“拼接上游导出”。
 
+还提供 `POST /api/diff`：对照**基线版（baseline）**与**候选版（candidate）**两张加工图，按
+**导出列名**配对，返回两版各自的完整审查以及全部列的前后阻断结论，并把变化原因按**内容影响**、
+**行影响**分别列出新增与消失；据此给出候选版是否**新增导出风险（风险回退）**的标记，详见下文
+“两版导出风险对照”。
+
 另外提供 `POST /api/preview`：给加工图提供**小样本预演**——按源 ID 提供样例行、按筛选 ID
 提供等值条件，服务按图的投影、筛选透传与等值连接定义跑出导出节点的样本二维表；**只有审查通过
 （不阻断）时才返回样本数据**，阻断时只返回审查原因，详见下文“小样本预演”。
@@ -762,6 +767,151 @@ curl -s -i -X POST http://localhost:8080/api/compose \
 #   "missing":["email","country"],"extra":[]}}
 ```
 
+## 两版导出风险对照：POST /api/diff
+
+对照两版加工图，找出**候选版相对基线版新增的导出风险**。请求体包含两份各自完整的审查请求：
+
+* `baseline`：基线版（`nodes` + `export`，1–60 个节点）；
+* `candidate`：候选版（同结构）。
+
+两张图**分别沿用整图校验**（与 `/api/review` 完全相同的规则，无关分支的错误也拒绝）：
+**任一图无效则整次请求以 400 拒绝**（错误体格式不变，`{"error": {...}}`，不返回任何部分对照）；
+字段类型不符、未知字段、节点超过 60 等 schema 问题仍返回 422。基线图先校验、候选图后校验。
+
+### 配对与排序
+
+* **按导出列名配对**：两版导出节点上**同名**的列视为同一列，与其内部血缘变化无关；来源以
+  **源 ID + 列名**识别。
+* 响应 `columns` 先按**候选版列序**列出候选导出的全部列（含两版共有列与候选新增列），再按
+  **基线版列序**追加候选中已删除的列。
+* 每类原因（`content_reasons` / `row_reasons` 的 `added` / `removed`）按 `(node_id, column)`
+  **字典序排序并去重**。
+* **缺席侧**（新增列的基线侧、删除列的候选侧）阻断结论为 `null`，其原因集合视为**空集**：
+  新增列的基线侧无任何原因，删除列的候选侧也无任何原因。
+
+### 响应结构
+
+* `baseline` / `candidate`：两版各自完整的 `/api/review` 审查结果；
+* `columns`：逐列对照，每列包含
+  * `name`：导出列名；
+  * `baseline.blocked` / `candidate.blocked`：前后阻断结论，缺席侧为 `null`；
+  * `content_reasons.added` / `content_reasons.removed`：内容影响来源的新增与消失；
+  * `row_reasons.added` / `row_reasons.removed`：行影响来源的新增与消失；
+  * `regression`：该列是否构成风险回退（规则见下）；
+* 顶层 `regression`：任一列回退即为 `true`。
+
+### 风险回退（regression）规则
+
+* **候选新增的阻断列**（基线缺席、候选 `blocked: true`）算回退；
+* **共有列新增了任一类原因**（内容或行影响的 `added` 非空）算回退——特别地，**同一来源从
+  内容影响转为行影响**（如改由敏感列做筛选）即使该列前后都阻断，也算**新增行影响**、构成回退；
+* **删除阻断列不算回退**（风险随列消失），**候选新增的安全列也不算回退**；
+* 只有原因消失（阻断变安全、行影响消失等）不算回退。
+
+服务**不修改两份输入图，也不生成任何修订图**；旧接口与错误格式保持不变。
+
+### 内容来源转为筛选行影响的对照（可直接执行）
+
+示例 `examples/diff_request.json` 中，基线版筛选只引用非敏感列 `country`，导出列 `mail` 仅带
+**内容影响**（复制了敏感列 `users.email`）；候选版改为按**敏感列 `email` 筛选**——同一来源
+`users.email` 在 `mail` 列上**从内容影响转为行影响**（前后都阻断），行影响还落到其余每一列；
+同时候选新增了常量列 `tag`（被行影响阻断）、删除了安全常量列 `bucket`：
+
+```bash
+curl -s -X POST http://localhost:8080/api/diff \
+  -H 'Content-Type: application/json' \
+  --data @examples/diff_request.json
+```
+
+```json
+{
+  "baseline": {"export": "export_users", "blocked": true, "columns": [
+    {"name": "user_id", "blocked": false, "content_reasons": [], "row_reasons": []},
+    {"name": "mail", "blocked": true,
+     "content_reasons": [{"node_id": "users", "column": "email"}], "row_reasons": []},
+    {"name": "bucket", "blocked": false, "content_reasons": [], "row_reasons": []}]},
+  "candidate": {"export": "export_users", "blocked": true, "columns": [
+    {"name": "user_id", "blocked": true, "content_reasons": [],
+     "row_reasons": [{"node_id": "users", "column": "email"}]},
+    {"name": "mail", "blocked": true,
+     "content_reasons": [{"node_id": "users", "column": "email"}],
+     "row_reasons": [{"node_id": "users", "column": "email"}]},
+    {"name": "tag", "blocked": true, "content_reasons": [],
+     "row_reasons": [{"node_id": "users", "column": "email"}]}]},
+  "columns": [
+    {"name": "user_id", "baseline": {"blocked": false}, "candidate": {"blocked": true},
+     "content_reasons": {"added": [], "removed": []},
+     "row_reasons": {"added": [{"node_id": "users", "column": "email"}], "removed": []},
+     "regression": true},
+    {"name": "mail", "baseline": {"blocked": true}, "candidate": {"blocked": true},
+     "content_reasons": {"added": [], "removed": []},
+     "row_reasons": {"added": [{"node_id": "users", "column": "email"}], "removed": []},
+     "regression": true},
+    {"name": "tag", "baseline": {"blocked": null}, "candidate": {"blocked": true},
+     "content_reasons": {"added": [], "removed": []},
+     "row_reasons": {"added": [{"node_id": "users", "column": "email"}], "removed": []},
+     "regression": true},
+    {"name": "bucket", "baseline": {"blocked": false}, "candidate": {"blocked": null},
+     "content_reasons": {"added": [], "removed": []},
+     "row_reasons": {"added": [], "removed": []},
+     "regression": false}
+  ],
+  "regression": true
+}
+```
+
+要点：`mail` 列两版都阻断，但同一来源新增了**行影响**，仍判 `regression: true`；新增阻断列
+`tag` 同样回退；删除的安全列 `bucket` 不回退。列序为候选列序（`user_id`、`mail`、`tag`）后接
+基线中被删除的列（`bucket`）。
+
+新增**安全**列不算回退（把候选的筛选改回非敏感列 `country`，新增常量列 `tag` 两侧都干净）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/diff \
+  -H 'Content-Type: application/json' \
+  -d "$(jq '
+    .candidate.nodes[1].references = ["country"] |
+    .candidate.nodes[2].columns = [
+      {"name": "user_id", "copy": "uid"},
+      {"name": "mail", "copy": "email"},
+      {"name": "tag", "constant": "v2"}
+    ]' examples/diff_request.json)" \
+| jq '{regression, tag: (.columns[] | select(.name == "tag"))}'
+# {"regression": false,
+#  "tag": {"name": "tag", "baseline": {"blocked": null},
+#          "candidate": {"blocked": false}, ..., "regression": false}}
+```
+
+删除**阻断**列同样不算回退（候选里去掉内容阻断列 `mail`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/diff \
+  -H 'Content-Type: application/json' \
+  -d "$(jq '
+    .candidate.nodes[1].references = ["country"] |
+    .candidate.nodes[2].columns = [
+      {"name": "user_id", "copy": "uid"},
+      {"name": "tag", "constant": "v2"}
+    ]' examples/diff_request.json)" \
+| jq '{regression, mail: (.columns[] | select(.name == "mail"))}'
+# {"regression": false,
+#  "mail": {"name": "mail", "baseline": {"blocked": true},
+#           "candidate": {"blocked": null},
+#           "content_reasons": {"added": [], "removed": [
+#             {"node_id": "users", "column": "email"}]}, ...,
+#           "regression": false}}
+```
+
+任一图无效时整次拒绝、无部分对照（错误格式与旧接口一致）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/api/diff \
+  -H 'Content-Type: application/json' \
+  -d "$(jq '.baseline.export = "ghost"' examples/diff_request.json)"
+# HTTP/1.1 400 ... {"error":{"code":"INVALID_REFERENCE", ...
+#   "message":"export node 'ghost' does not exist","node_id":"ghost"}}
+```
+
 ## 小样本预演：POST /api/preview
 
 用调用方自带的小样本数据把图“跑一遍”，预览导出节点的实际行数据。请求体在审查请求基础上
@@ -987,11 +1137,11 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest 与 PreviewRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接与小样本预演
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/health）
-examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接与预演测试
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、DiffRequest 与 PreviewRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、两版风险对照与小样本预演
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/diff、/api/preview、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、diff_request.json、preview_request.json）
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、两版对照与预演测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```
