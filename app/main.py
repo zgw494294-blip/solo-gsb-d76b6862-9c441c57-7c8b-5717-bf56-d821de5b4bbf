@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from .engine import (
     ValidationError,
+    compare,
     compose,
     preview,
     prune,
@@ -13,6 +14,7 @@ from .engine import (
     revise,
 )
 from .models import (
+    CompareRequest,
     ComposeRequest,
     PreviewRequest,
     PruneRequest,
@@ -31,12 +33,13 @@ app = FastAPI(
         "columns of a source node while keeping every in-graph reference "
         "pointing at the same original columns, can compose an upstream "
         "graph's export into a downstream graph's source position, yielding "
-        "one reviewable combined graph, and can run a small-sample preview "
+        "one reviewable combined graph, can run a small-sample preview "
         "of an export over caller-provided source rows and filter "
         "conditions, returning sample data only when the export passes "
-        "review."
+        "review, and can diff a baseline graph against a candidate graph "
+        "to report the export risks the candidate newly introduces."
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -87,3 +90,8 @@ async def compose_graphs(request: ComposeRequest) -> dict[str, object]:
 @app.post("/api/preview")
 async def preview_export(request: PreviewRequest) -> dict[str, object]:
     return preview(request)
+
+
+@app.post("/api/compare")
+async def compare_exports(request: CompareRequest) -> dict[str, object]:
+    return compare(request)

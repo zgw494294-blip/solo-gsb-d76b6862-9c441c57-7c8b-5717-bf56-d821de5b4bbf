@@ -226,6 +226,22 @@ class ComposeRequest(StrictModel):
         return self
 
 
+class CompareRequest(StrictModel):
+    """Two whole review-shaped graphs to diff for newly introduced export risk.
+
+    ``baseline`` and ``candidate`` each carry ``nodes`` + ``export`` and are
+    validated independently under exactly the same rules as
+    :class:`ReviewRequest` (duplicate ids, column conflicts, invalid
+    references and cycles included): an invalid graph on either side rejects
+    the whole request. Export columns are paired by name; an origin is the
+    ``(node_id, column)`` pair, so an identically named origin in the two
+    graphs is the same source even when the surrounding graph differs.
+    """
+
+    baseline: ReviewRequest
+    candidate: ReviewRequest
+
+
 class PreviewRequest(StrictModel):
     """A small-sample dry run of one export over caller-provided source rows.
 

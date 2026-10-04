@@ -29,6 +29,12 @@ the downstream source node is replaced in place by a single projection that
 copies the mapped upstream export columns, and the upstream export together
 with its dependency ancestors is appended (ids renamed where they collide).
 Provenance at the replacement position is taken from the upstream graph.
+
+``compare`` validates two whole graphs independently and diffs their export
+reviews column by column (columns paired by name, origins identified by
+``(source node id, source column name)``), listing content and row origins
+added or removed by the candidate and flagging the risk the candidate newly
+introduces.
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ from collections import defaultdict, deque
 from typing import Union
 
 from .models import (
+    CompareRequest,
     ComposeRequest,
     FilterNodeIn,
     JoinNodeIn,
@@ -1558,4 +1565,142 @@ def preview(request: PreviewRequest) -> dict[str, object]:
         "columns": export_columns,
         "rows": [[row[name] for name in export_columns] for row in export_table],
         "review": review_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Comparing a baseline graph against a candidate graph
+# ---------------------------------------------------------------------------
+#
+# Each side is a whole, independently validated review-shaped graph. The two
+# exports are compared column by column, pairing columns by name; an origin is
+# a (source node id, source column name) pair, so an identically named origin
+# in the two graphs denotes the same source. For every paired column the diff
+# lists the content and row origins that were added or removed by the
+# candidate. A side missing the column carries a ``null`` verdict and its
+# reason sets are treated as empty for the comparison. Neither input graph is
+# ever mutated and no revised graph is ever produced.
+
+
+def _reason_set(reasons: list[dict[str, str]]) -> frozenset[Origin]:
+    """Parse a review's reason list back into a set of origin tuples."""
+    return frozenset((item["node_id"], item["column"]) for item in reasons)
+
+
+def _column_origin_sets(
+    review_result: dict[str, object],
+) -> dict[str, tuple[bool, frozenset[Origin], frozenset[Origin]]]:
+    """Map export column name to (blocked, content origins, row origins)."""
+    columns: dict[str, tuple[bool, frozenset[Origin], frozenset[Origin]]] = {}
+    for col in review_result["columns"]:
+        columns[col["name"]] = (
+            bool(col["blocked"]),
+            _reason_set(col["content_reasons"]),
+            _reason_set(col["row_reasons"]),
+        )
+    return columns
+
+
+def _added_removed(
+    before: frozenset[Origin], after: frozenset[Origin]
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Sorted, de-duplicated reason lists for the candidate minus / plus set."""
+    return _origin_view(after - before), _origin_view(before - after)
+
+
+def compare(request: CompareRequest) -> dict[str, object]:
+    """Diff the export reviews of a baseline graph and a candidate graph.
+
+    Both graphs are validated independently under exactly the same rules as
+    :func:`review`; an invalid graph on either side rejects the whole request
+    with that side's original error format, and no partial diff is returned.
+
+    Export columns are paired by name. Common and candidate-only columns are
+    emitted in the candidate's column order; columns the candidate deleted
+    follow in the baseline's column order. Each entry carries both sides'
+    ``blocked`` verdicts (``null`` on the side the column is absent, whose
+    reasons count as the empty set) and, split by content and row influence,
+    the sorted de-duplicated origins added and removed by the candidate.
+
+    ``regression`` marks newly introduced risk only: it is true when a blocked
+    column is newly added, or a column common to both exports gains any kind
+    of reason — including an origin that moved from content to row influence
+    on the same source (the new row reason counts even though the column was
+    blocked before). A deleted blocked column and a newly added safe column
+    are not regressions. The input graphs are never modified and no revised
+    graph is produced.
+    """
+    _b_by_id, _b_order, baseline_relations = _evaluate_graph(request.baseline)
+    _c_by_id, _c_order, candidate_relations = _evaluate_graph(request.candidate)
+
+    baseline_review = _review_export(request.baseline.export, baseline_relations)
+    candidate_review = _review_export(request.candidate.export, candidate_relations)
+
+    baseline_columns = _column_origin_sets(baseline_review)
+    candidate_columns = _column_origin_sets(candidate_review)
+
+    candidate_order = [col["name"] for col in candidate_review["columns"]]
+    baseline_order = [col["name"] for col in baseline_review["columns"]]
+
+    # Common and new columns follow the candidate order; deleted columns then
+    # follow the baseline order.
+    paired_order = candidate_order + [
+        name for name in baseline_order if name not in candidate_columns
+    ]
+
+    columns_out: list[dict[str, object]] = []
+    regression = False
+    for name in paired_order:
+        baseline_entry = baseline_columns.get(name)
+        candidate_entry = candidate_columns.get(name)
+
+        if baseline_entry is None:
+            baseline_blocked: bool | None = None
+            baseline_content: frozenset[Origin] = frozenset()
+            baseline_rows: frozenset[Origin] = frozenset()
+        else:
+            baseline_blocked, baseline_content, baseline_rows = baseline_entry
+
+        if candidate_entry is None:
+            candidate_blocked: bool | None = None
+            candidate_content: frozenset[Origin] = frozenset()
+            candidate_rows: frozenset[Origin] = frozenset()
+        else:
+            candidate_blocked, candidate_content, candidate_rows = candidate_entry
+
+        content_added, content_removed = _added_removed(
+            baseline_content, candidate_content
+        )
+        row_added, row_removed = _added_removed(baseline_rows, candidate_rows)
+
+        if candidate_entry is not None and baseline_entry is None:
+            # A newly added blocked column is newly introduced risk; a newly
+            # added safe column is not.
+            if candidate_blocked:
+                regression = True
+        elif baseline_entry is not None and candidate_entry is not None:
+            # Gaining any reason kind on a common column is a regression; an
+            # origin moving from content to row influence gains a row reason
+            # even though the column was blocked on both sides.
+            if content_added or row_added:
+                regression = True
+        # Deleted columns can never add risk, regardless of their old verdict.
+
+        columns_out.append(
+            {
+                "name": name,
+                "baseline_blocked": baseline_blocked,
+                "candidate_blocked": candidate_blocked,
+                "content_added_reasons": content_added,
+                "content_removed_reasons": content_removed,
+                "row_added_reasons": row_added,
+                "row_removed_reasons": row_removed,
+            }
+        )
+
+    return {
+        "baseline": baseline_review,
+        "candidate": candidate_review,
+        "regression": regression,
+        "columns": columns_out,
     }

@@ -29,6 +29,11 @@
 提供等值条件，服务按图的投影、筛选透传与等值连接定义跑出导出节点的样本二维表；**只有审查通过
 （不阻断）时才返回样本数据**，阻断时只返回审查原因，详见下文“小样本预演”。
 
+最后提供 `POST /api/compare`：对照**基线版（baseline）与候选版（candidate）两张完整加工图**，
+各自沿用整图校验（任一图无效即整次拒绝，错误码与格式同 `/api/review`），再按导出列名配对，
+分别给出内容、行影响两类原因的新增与消失，并标出候选版是否引入新的导出风险（`regression`）；
+同一来源从内容影响转为筛选行影响也算新增行影响，即使两版该列都阻断，详见下文“两版导出风险对照”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -58,6 +63,11 @@
 `POST /api/rename` 同样先校验整张原图（无关分支的错误也拒绝），再执行改名；源节点不存在、
 原列缺失、改名后源列名重复或复审不一致判为 400，改名列表为空、原列名重复/为空、新名为空等
 schema 问题判为 422。
+
+`POST /api/compare` 的 `baseline` 与 `candidate` 各自是一张完整审查请求，**分别沿用上述全部
+整图校验**（重复 ID、列名冲突、无效引用、环、超过 60 节点等）：先校验基线、再校验候选，任一图
+无效即以该侧的原错误码与错误格式返回 HTTP 400，不返回任何对照结果；schema 问题（未知字段、
+节点超过 60 等）返回 HTTP 422。
 
 ## 单条命令启动
 
@@ -952,6 +962,144 @@ curl -s -X POST http://localhost:8080/api/preview \
 `rows` 缺失、结构类型不符（如 `rows` 不是“ID → 行数组”的对象、单元格行不是对象）、未知字段、
 节点超过 60 等 schema 问题返回 HTTP 422。
 
+## 两版导出风险对照：POST /api/compare
+
+对照**基线版与候选版**两张完整加工图，找出候选版**新引入**的导出风险。请求体：
+
+```jsonc
+{
+  "baseline": {"nodes": [ ... ], "export": "..."},   // 与 /api/review 请求体完全同构
+  "candidate": {"nodes": [ ... ], "export": "..."}   // 与 /api/review 请求体完全同构
+}
+```
+
+两版图**分别沿用 `/api/review` 的整图校验**（先基线后候选，无关分支的错误也拒绝）：任一图
+无效即以该侧原错误码（`DUPLICATE_NODE` / `COLUMN_CONFLICT` / `INVALID_REFERENCE` / `CYCLE`）
+返回 HTTP 400，错误格式与旧接口一致，不给出任何对照结果；schema 问题返回 HTTP 422。
+服务**不修改任何一侧输入**，也不生成修订图。
+
+### 配对、列序与原因排序
+
+* **列配对**：按导出**列名**配对，两版同名导出列视为同一列；来源以 **(源节点 ID, 源列名)**
+  识别，两版同名来源视为同一来源（即使两版中间加工结构不同）。
+* **列序**：共有列与新增列按**候选导出列序**排列，随后按**基线列序**列出候选已删除的列。
+* **缺席侧**：某列只存在于一侧时，另一侧 `baseline_blocked` / `candidate_blocked` 为 `null`，
+  其原因在对照中视为**空集**。
+* **原因**：每列分别给出**内容影响**与**行影响**的新增、消失原因；原因按
+  `(node_id, column)` 字典序排序、去重（与审查输出一致）。
+
+### 响应
+
+`baseline` / `candidate` 是两侧各自完整的 `/api/review` 审查结果；`columns` 逐列给出前后
+阻断结论与四类原因差异：
+
+```jsonc
+{
+  "baseline": { ... 完整 review 结果 ... },
+  "candidate": { ... 完整 review 结果 ... },
+  "regression": true,                 // 候选版是否引入新的导出风险
+  "columns": [
+    {
+      "name": "a",
+      "baseline_blocked": true,       // 基线侧无此列时为 null
+      "candidate_blocked": true,      // 候选侧无此列时为 null
+      "content_added_reasons": [/* 候选新增的内容来源 */],
+      "content_removed_reasons": [/* 候选消失的内容来源 */],
+      "row_added_reasons": [/* 候选新增的行影响来源 */],
+      "row_removed_reasons": [/* 候选消失的行影响来源 */]
+    }
+  ]
+}
+```
+
+### 风险回退标记 `regression`
+
+仅在以下情形为 `true`：
+
+1. **新增阻断列**：候选新增的导出列在候选侧 `blocked: true`（新增安全列**不算**回退）；
+2. **共有列新增任一类原因**：两版同名列的内容原因或行原因集合出现任何新增。
+
+特别地：**同一来源从内容影响转为行影响**（例如原来复制敏感列、改为对该敏感列筛选后只导出
+其他列）时，即使该列前后都阻断，行原因集合新增了该来源，仍判 `regression: true`。
+删除阻断列、仅消失原因（风险减弱）都**不算**回退。
+
+### 内容来源转为筛选行影响（可直接执行）
+
+示例文件 `examples/compare_request.json`：基线版导出列 `a` 直接复制敏感列 `s.x`（**内容影响**）；
+候选版改为先对 `s.x` 筛选、`a` 复制干净的 `s.y`——`s.x` 不再流入 `a` 的内容，却开始影响结果
+的行集合（**行影响**）。该列前后都阻断，但行影响是候选新增，故 `regression` 为 `true`：
+
+```bash
+curl -s -X POST http://localhost:8080/api/compare \
+  -H 'Content-Type: application/json' \
+  --data @examples/compare_request.json
+```
+
+```json
+{
+  "baseline": {"export": "e", "blocked": true, "columns": [
+    {"name": "a", "blocked": true,
+     "content_reasons": [{"node_id": "s", "column": "x"}], "row_reasons": []}]},
+  "candidate": {"export": "e", "blocked": true, "columns": [
+    {"name": "a", "blocked": true,
+     "content_reasons": [], "row_reasons": [{"node_id": "s", "column": "x"}]}]},
+  "regression": true,
+  "columns": [
+    {"name": "a", "baseline_blocked": true, "candidate_blocked": true,
+     "content_added_reasons": [],
+     "content_removed_reasons": [{"node_id": "s", "column": "x"}],
+     "row_added_reasons": [{"node_id": "s", "column": "x"}],
+     "row_removed_reasons": []}
+  ]
+}
+```
+
+删除阻断列、新增安全列都不算回退（下例候选删掉阻断列 `secret`、新增干净列 `tag`，
+`regression` 为 `false`，删除列排在候选列之后）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/compare \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "baseline": {
+    "nodes": [
+      {"id": "s", "type": "source",
+       "columns": [{"name": "id_card", "sensitive": true}, {"name": "tag"}]},
+      {"id": "e", "type": "projection", "input": "s", "columns": [
+        {"name": "secret", "copy": "id_card"}, {"name": "tag", "copy": "tag"}]}
+    ],
+    "export": "e"
+  },
+  "candidate": {
+    "nodes": [
+      {"id": "s", "type": "source", "columns": [{"name": "tag"}]},
+      {"id": "e", "type": "projection", "input": "s",
+       "columns": [{"name": "tag", "copy": "tag"}]}
+    ],
+    "export": "e"
+  }
+}'
+# columns 顺序为 ["tag", "secret"]；tag 两侧均不阻断，secret 的 candidate_blocked 为 null；
+# regression 为 false
+```
+
+任一图无效时整次拒绝，沿用旧错误格式：
+
+```bash
+curl -s -i -X POST http://localhost:8080/api/compare \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "baseline": {"nodes": [{"id": "s", "type": "source",
+                          "columns": [{"name": "x"}]}], "export": "s"},
+  "candidate": {"nodes": [{"id": "s", "type": "source",
+                           "columns": [{"name": "x"}]},
+                          {"id": "e", "type": "projection", "input": "ghost",
+                           "columns": [{"name": "a", "copy": "x"}]}],
+                 "export": "e"}
+}'
+# HTTP/1.1 400 ... {"error":{"code":"INVALID_REFERENCE", ...
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -987,11 +1135,11 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest 与 PreviewRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接与小样本预演
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/health）
-examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接与预演测试
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest 与 CompareRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、小样本预演与两版导出风险对照
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json）
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演与两版对照测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```
